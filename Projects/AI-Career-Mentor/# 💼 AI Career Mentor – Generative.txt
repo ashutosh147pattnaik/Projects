@@ -1,0 +1,21 @@
+# 💼 AI Career Mentor – Generative AI Resume & Job Match Analyzer
+
+A **Generative AI-powered web app** that evaluates resume–job compatibility using semantic embeddings and NLP.
+
+## 🚀 Features
+- Analyzes resumes and job descriptions for keyword & skill alignment  
+- Generates AI-based feedback and optimization suggestions  
+- Uses open-source NLP models (Sentence Transformers – `all-MiniLM-L6-v2`)  
+- 100% free & runs locally or on Streamlit Cloud  
+
+## 🧰 Tech Stack
+- Python  
+- Streamlit  
+- HuggingFace Transformers  
+- Sentence-Transformers  
+- PyPDF2, Scikit-learn, FuzzyWuzzy  
+
+## 🧠 How to Run Locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py

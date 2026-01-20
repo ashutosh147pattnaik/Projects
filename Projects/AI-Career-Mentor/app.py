@@ -13,7 +13,7 @@ import re
 # 🔑 API KEY (OPTIONAL)
 # ================================================================
 
-AI_API_KEY = "AIzaSyCyeyB_AsdFYBC1TG8Iqs21GXD1sksLWUc"
+AI_API_KEY = "AIzaSyCr5dU330YZd6zCC4g2fvHXleAqHGXni9U"
 
 # ================================================================
 # PAGE CONFIG
@@ -285,3 +285,4 @@ elif st.session_state.page == "analyzing":
     analyzing_page()
 elif st.session_state.page == "result":
     result_page()
+

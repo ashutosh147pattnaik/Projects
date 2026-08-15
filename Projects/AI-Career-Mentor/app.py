@@ -1,8 +1,7 @@
-# ================================================================
-# AI CAREER MENTOR – ADVANCED ATS RESUME ANALYZER
-# FULL REWRITE MODE: Generates brand new single-column ATS PDF 
-# Extracts & includes original user photo if present.
-# ================================================================
+import os
+import io
+import re
+import secrets  # Replaced 'random' to pass GitHub Bandit security tests
 
 import streamlit as st
 import pypdf
@@ -10,31 +9,24 @@ import pymupdf
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from PIL import Image
-import io
-import time
-import re
-import random
 
 # ================================================================
-# 🔑 API KEY (OPTIONAL)
+# 🔑 API KEY (SECURE IMPLEMENTATION)
 # ================================================================
-AI_API_KEY = st.secrets.get("GEMINI_API_KEY", "AIzaSyCr5dU330YZd6zCC4g2fvHXleAqHGXni9U") if hasattr(st, "secrets") else "AIzaSyCr5dU330YZd6zCC4g2fvHXleAqHGXni9U"
+def get_api_key():
+    if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+        return st.secrets["GEMINI_API_KEY"]
+    return os.environ.get("GEMINI_API_KEY")
 
-# ================================================================
-# PAGE CONFIG
-# ================================================================
-st.set_page_config(page_title="AI Career Mentor", page_icon="🤖", layout="wide")
-
-# ================================================================
-# TRY GEMINI
-# ================================================================
+AI_API_KEY = get_api_key()
 ONLINE_AVAILABLE = False
+
 try:
-    if AI_API_KEY and AI_API_KEY != "PASTE_YOUR_GEMINI_API_KEY_HERE":
+    if AI_API_KEY:
         import google.generativeai as genai
         genai.configure(api_key=AI_API_KEY)
         ONLINE_AVAILABLE = True
-except Exception:
+except Exception as e:
     ONLINE_AVAILABLE = False
 
 # ================================================================
@@ -45,14 +37,14 @@ def extract_pdf_text_from_bytes(pdf_bytes):
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         text = ""
         for page in reader.pages:
-            if page.extract_text():
-                text += page.extract_text() + "\n"
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n"
         return text.strip()
-    except Exception:
+    except Exception as e:
         return None
 
 def extract_profile_image(pdf_bytes):
-    """Scans the PDF for the first image (usually a profile photo) and extracts it."""
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         for page in doc:
@@ -62,12 +54,11 @@ def extract_profile_image(pdf_bytes):
                 base_image = doc.extract_image(xref)
                 image_bytes = base_image["image"]
                 
-                # Convert to standard PNG using PIL to ensure compatibility with FPDF
                 img = Image.open(io.BytesIO(image_bytes))
                 img_byte_arr = io.BytesIO()
                 img.save(img_byte_arr, format='PNG')
                 return img_byte_arr.getvalue()
-    except Exception:
+    except Exception as e:
         pass
     return None
 
@@ -75,7 +66,6 @@ def tokenize(text):
     return re.findall(r'\b[a-zA-Z]{2,}\b', text.lower())
 
 def sanitize_for_fpdf(text):
-    """Replaces smart quotes and removes characters FPDF (latin-1) cannot handle."""
     text = text.replace('”', '"').replace('“', '"').replace('’', "'").replace('‘', "'").replace('–', '-')
     return text.encode('latin-1', 'ignore').decode('latin-1')
 
@@ -87,7 +77,7 @@ def offline_analysis(resume, job):
     j = set(tokenize(job))
     common = r & j
 
-    keyword_score = int((len(common) / max(len(j), 1)) * 100)
+    keyword_score = int((len(common) / max(len(j), 1)) * 100) if j else 0
     skills = min(100, keyword_score + 10)
     experience = min(100, keyword_score + 5)
     format_score = 75
@@ -140,8 +130,9 @@ Begin the rewritten resume now:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
-            return response.text.strip()
-        except Exception:
+            if response.text:
+                return response.text.strip()
+        except Exception as e:
             continue
     raise RuntimeError("Failed to generate text online.")
 
@@ -149,57 +140,42 @@ Begin the rewritten resume now:
 # PDF GENERATOR
 # ================================================================
 def create_ats_pdf(text, image_bytes=None):
-    """Generates a strict, single-column ATS-friendly PDF."""
     pdf = FPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     
-    # 1. Add Profile Photo if extracted
     if image_bytes:
         try:
             pdf.image(io.BytesIO(image_bytes), x=10, y=10, w=30)
-            pdf.ln(35) # Add space below the image
-        except Exception:
-            pass # Skip image if it fails to render
+            pdf.ln(35)
+        except Exception as e:
+            pass
 
-    # 2. Add Text
     for line in text.split("\n"):
         clean_line = sanitize_for_fpdf(line.strip())
         
-        if clean_line.startswith("## "): # Section Heading
+        if clean_line.startswith("## "):
             pdf.set_font("Arial", style="B", size=12)
             pdf.ln(4)
             pdf.multi_cell(0, 6, clean_line.replace("## ", ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font("Arial", size=11)
             pdf.ln(1)
-        elif clean_line.startswith("# "): # Name/Main Title
+        elif clean_line.startswith("# "):
             pdf.set_font("Arial", style="B", size=14)
             pdf.multi_cell(0, 7, clean_line.replace("# ", ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font("Arial", size=11)
             pdf.ln(2)
-        elif clean_line.startswith("* ") or clean_line.startswith("- "): # Bullet points
+        elif clean_line.startswith("* ") or clean_line.startswith("- "):
             pdf.set_font("Arial", size=11)
-            # Indent bullets slightly
             pdf.set_x(15)
             pdf.multi_cell(0, 6, chr(149) + " " + clean_line[2:], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        elif clean_line: # Standard text
+        elif clean_line:
             pdf.set_font("Arial", size=11)
             pdf.multi_cell(0, 6, clean_line, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
-            pdf.ln(3) # Empty lines
+            pdf.ln(3)
 
     return bytes(pdf.output())
-
-# ================================================================
-# SESSION STATE INIT
-# ================================================================
-if "page" not in st.session_state:
-    st.session_state.update({
-        "page": "upload", "original_resume_text": None, "original_pdf_bytes": None, 
-        "profile_image": None, "job": None, "mode": "auto", "extra_info": "", 
-        "target_score": 90, "rounds_used": 0, "generated_pdf_bytes": None, 
-        "current_resume_text": None
-    })
 
 # ================================================================
 # CALLBACKS
@@ -210,7 +186,7 @@ def add_skill_to_draft(skill, widget_key):
         f"Leveraged {skill} to deliver high-quality project outcomes.",
         f"Proficient in using {skill} for complex problem-solving."
     ]
-    phrase = random.choice(phrases)
+    phrase = secrets.choice(phrases)
     current_val = st.session_state.get(widget_key, "").strip()
     st.session_state[widget_key] = current_val + " " + phrase if current_val else phrase
 
@@ -219,6 +195,10 @@ def add_skill_to_draft(skill, widget_key):
 # ================================================================
 def upload_page():
     st.markdown("## 🤖 AI Career Mentor")
+    
+    if not ONLINE_AVAILABLE:
+        st.warning("⚠️ Gemini API Key not detected. The app will run in offline mode.")
+        
     resume = st.file_uploader("📄 Upload Resume (PDF)", type=["pdf"])
     job = st.text_area("📋 Paste Job Description", height=200)
 
@@ -239,9 +219,12 @@ def upload_page():
             st.rerun()
 
 def analyzing_page():
+    import time
     st.markdown("## 🔍 Analyzing Resume")
     bar = st.progress(0)
-    for i in [30, 60, 100]: time.sleep(0.3); bar.progress(i)
+    for i in [30, 60, 100]: 
+        time.sleep(0.1)
+        bar.progress(i)
     
     st.session_state.offline = offline_analysis(st.session_state.current_resume_text, st.session_state.job)
     st.session_state.page = "result"
@@ -258,16 +241,18 @@ def result_page():
     st.caption("We will extract your content (and photo) and generate a brand-new, strictly formatted, single-column ATS document.")
     st.session_state.target_score = st.slider("🎯 Target ATS Score", 50, 98, 90)
     
-    if st.button("✅ Yes, rebuild my resume", type="primary", use_container_width=True):
-        st.session_state.page = "fixing"
-        st.rerun()
+    if not ONLINE_AVAILABLE:
+        st.error("AI is currently offline. You must configure an API key to rewrite the resume.")
+    else:
+        if st.button("✅ Yes, rebuild my resume", type="primary", use_container_width=True):
+            st.session_state.page = "fixing"
+            st.rerun()
 
 def fixing_page():
     st.markdown("## 🛠️ Rebuilding Resume from Scratch...")
     
     missing = st.session_state.offline["missing"]
     
-    # AI Generation
     new_text = rewrite_resume_online(
         st.session_state.original_resume_text, 
         st.session_state.job, 
@@ -275,10 +260,7 @@ def fixing_page():
         st.session_state.extra_info
     )
     
-    # PDF Creation
     new_pdf_bytes = create_ats_pdf(new_text, st.session_state.profile_image)
-    
-    # Re-analyze new text
     new_score_data = offline_analysis(new_text, st.session_state.job)
     
     st.session_state.generated_pdf_bytes = new_pdf_bytes
@@ -312,7 +294,7 @@ def need_more_info_page():
                       on_click=add_skill_to_draft, args=(skill, widget_key))
                 
     new_info = st.text_area(
-        "Edit your added experience here (we will integrate this into the next rebuild):", 
+        "Edit your added experience here:", 
         key=widget_key, 
         height=100
     )
@@ -344,7 +326,7 @@ def fixed_result_page():
             pix = preview_doc[i].get_pixmap(dpi=110)
             cols[i % 3].image(pix.tobytes("png"), use_container_width=True, caption=f"Page {i + 1}")
         preview_doc.close()
-    except Exception:
+    except Exception as e:
         pass
 
     st.download_button("⬇️ Download ATS Resume", data=pdf_bytes, file_name="ATS_Optimized_Resume.pdf", mime="application/pdf", use_container_width=True, type="primary")
@@ -353,8 +335,33 @@ def fixed_result_page():
         st.rerun()
 
 # ================================================================
-# ROUTER
+# MAIN EXECUTION
 # ================================================================
-pages = {"upload": upload_page, "analyzing": analyzing_page, "result": result_page, 
-         "fixing": fixing_page, "need_more_info": need_more_info_page, "fixed_result": fixed_result_page}
-pages[st.session_state.page]()
+def main():
+    st.set_page_config(page_title="AI Career Mentor", page_icon="🤖", layout="wide")
+    
+    if "page" not in st.session_state:
+        st.session_state.update({
+            "page": "upload", "original_resume_text": None, "original_pdf_bytes": None, 
+            "profile_image": None, "job": None, "mode": "auto", "extra_info": "", 
+            "target_score": 90, "rounds_used": 0, "generated_pdf_bytes": None, 
+            "current_resume_text": None
+        })
+
+    pages = {
+        "upload": upload_page, 
+        "analyzing": analyzing_page, 
+        "result": result_page, 
+        "fixing": fixing_page, 
+        "need_more_info": need_more_info_page, 
+        "fixed_result": fixed_result_page
+    }
+    
+    # Safely execute the current page
+    if st.session_state.page in pages:
+        pages[st.session_state.page]()
+    else:
+        pages["upload"]()
+
+if __name__ == "__main__":
+    main()

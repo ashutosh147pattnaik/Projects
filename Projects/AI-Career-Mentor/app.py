@@ -14,9 +14,9 @@ from PIL import Image
 # 🔑 API KEY (SECURE IMPLEMENTATION)
 # ================================================================
 def get_api_key():
-    if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-        return st.secrets["GEMINI_API_KEY"]
-    return os.environ.get("GEMINI_API_KEY")
+    if hasattr(st, "secrets") and "AIzaSyCr5dU330YZd6zCC4g2fvHXleAqHGXni9U" in st.secrets:
+        return st.secrets["AIzaSyCr5dU330YZd6zCC4g2fvHXleAqHGXni9U"]
+    return os.environ.get("AIzaSyCr5dU330YZd6zCC4g2fvHXleAqHGXni9U")
 
 AI_API_KEY = get_api_key()
 ONLINE_AVAILABLE = False

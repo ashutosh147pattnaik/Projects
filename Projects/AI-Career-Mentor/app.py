@@ -1,8 +1,3 @@
-# ================================================================
-# AI CAREER MENTOR – ADVANCED ATS RESUME ANALYZER
-# AI / LOCAL / AUTO MODE | SINGLE FILE
-# ================================================================
-
 import streamlit as st
 import pypdf
 import io

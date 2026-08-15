@@ -1,5 +1,7 @@
 # ================================================================
-# GEMINI
+# AI CAREER MENTOR – ADVANCED ATS RESUME ANALYZER
+# AI / LOCAL / AUTO MODE | SINGLE FILE
+# Now with: Clickable suggestions, Highlights, Full Preview, Iterative Loop
 # ================================================================
 
 import streamlit as st
@@ -164,7 +166,7 @@ def apply_fixes_to_pdf(pdf_bytes, fix_pairs):
             page.apply_redactions()
 
             for rect in rects:
-                # MARKER HIGHLIGHT ADDED HERE
+                # MARKER HIGHLIGHT
                 annot = page.add_highlight_annot(rect)
                 annot.update()
 
@@ -207,7 +209,8 @@ def fix_resume_to_target(pdf_bytes, resume_text, job, target_score, mode, extra_
 if "page" not in st.session_state:
     st.session_state.update({
         "page": "upload", "resume": None, "resume_pdf_bytes": None, "job": None, 
-        "mode": "auto", "extra_info": "", "target_score": 90, "applied_fixes": []
+        "mode": "auto", "extra_info": "", "target_score": 90, "applied_fixes": [],
+        "draft_new_info": "" # For the suggestion text area
     })
 
 # ================================================================
@@ -248,10 +251,12 @@ def result_page():
 
     st.markdown("### 🛠️ Auto-Fix Resume")
     st.session_state.target_score = st.slider("🎯 Target ATS Score", 50, 98, 90)
-    extra_info = st.text_area("➕ Optional: Add extra context or experience so the AI can use it to reach your target:", help="E.g., 'I used Python at my last job.'")
     
+    # Initialize draft state here just in case
+    if "draft_new_info" not in st.session_state:
+        st.session_state.draft_new_info = ""
+
     if st.button("✅ Yes, fix my resume", type="primary", use_container_width=True):
-        st.session_state.extra_info = extra_info
         st.session_state.page = "fixing"
         st.rerun()
 
@@ -279,18 +284,38 @@ def need_more_info_page():
     st.markdown("## ⚠️ Target Not Reached Yet")
     st.warning(f"We reached **{st.session_state.fixed_score['ats']}%**, but your target is **{st.session_state.target_score}%**.")
     st.write("We've run out of genuine experience to match against the job description. Still missing:")
-    st.write("**" + ", ".join(st.session_state.fixed_score["missing"]) + "**")
     
-    new_info = st.text_area("Do you have experience with any of the missing keywords above? Add it here:")
+    missing_skills = st.session_state.fixed_score["missing"]
+    st.write("**" + ", ".join(missing_skills) + "**")
+    
+    st.divider()
+    st.markdown("💡 **Click a missing skill to instantly add it to your context:**")
+    
+    # Generate clickable suggestion buttons for the top 6 missing skills
+    cols = st.columns(min(len(missing_skills), 6))
+    for i, skill in enumerate(missing_skills[:6]):
+        with cols[i]:
+            if st.button(f"➕ {skill}", key=f"btn_{skill}"):
+                prefix = "I have experience with " if not st.session_state.draft_new_info.strip() else " and "
+                st.session_state.draft_new_info += f"{prefix}{skill}"
+                st.rerun()
+                
+    st.text_area(
+        "Edit your added experience here (we will use this to update your resume):", 
+        key="draft_new_info", 
+        height=100
+    )
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 Use Info & Try Fixing Again", type="primary", use_container_width=True):
-            st.session_state.extra_info += "\n" + new_info
+            st.session_state.extra_info += "\n" + st.session_state.draft_new_info
+            st.session_state.draft_new_info = "" # Clear for next time
             st.session_state.page = "fixing"
             st.rerun()
     with col2:
         if st.button("⏹️ Stop & Get My Resume Now", use_container_width=True):
+            st.session_state.draft_new_info = ""
             st.session_state.page = "fixed_result"
             st.rerun()
 

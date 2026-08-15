@@ -6,8 +6,11 @@
 
 import streamlit as st
 import pypdf
+import pymupdf
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 import io
+import json
 import time
 import re
 
@@ -48,9 +51,9 @@ except Exception:
 # UTILITIES
 # ================================================================
 
-def extract_pdf_text(pdf_file):
+def extract_pdf_text_from_bytes(pdf_bytes):
     try:
-        reader = pypdf.PdfReader(io.BytesIO(pdf_file.getvalue()))
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         text = ""
         for page in reader.pages:
             if page.extract_text():
@@ -58,6 +61,9 @@ def extract_pdf_text(pdf_file):
         return text.strip()
     except Exception:
         return None
+
+def extract_pdf_text(pdf_file):
+    return extract_pdf_text_from_bytes(pdf_file.getvalue())
 
 def tokenize(text):
     return re.findall(r'\b[a-zA-Z]{2,}\b', text.lower())
@@ -141,63 +147,184 @@ Provide:
     raise RuntimeError("FAILED")
 
 # ================================================================
-# ONLINE GEMINI ENGINE — FIX
+# ONLINE GEMINI ENGINE — GENERATE TARGETED TEXT FIXES
 # ================================================================
+# Instead of rewriting the resume (which would force us to rebuild the PDF
+# from scratch and lose the original layout/photo), we ask the model for a
+# small list of exact find -> replace text swaps. These get applied directly
+# onto the original PDF, in place, leaving everything else untouched.
 
-def fix_resume_online(resume, job):
+def generate_fix_pairs_online(resume, job, missing):
+    missing_str = ", ".join(missing[:10]) if missing else "(none)"
     prompt = f"""
-You are an expert resume writer helping optimize a resume for ATS systems.
+You are an ATS resume editor. Do NOT rewrite or restructure the resume.
+Your only job is to propose small, targeted text replacements within the
+EXACT resume text below.
 
-Rewrite the resume below so that it:
-- Naturally incorporates relevant keywords from the job description
-- Uses strong action verbs and clear, concise phrasing
-- Quantifies achievements with numbers/percentages where plausible
-- Keeps consistent, ATS-friendly formatting (plain section headers, no tables/columns)
-- Does NOT invent employers, job titles, degrees, or dates that aren't in the original
+Rules (follow strictly):
+- "find" must be an EXACT, VERBATIM substring copied from the resume text
+  below (same spelling/punctuation/case), long enough to be unique — a
+  phrase or full sentence/bullet, not a single common word.
+- "replace" must be roughly the same LENGTH as "find" (within ~20%) so the
+  original layout doesn't shift or overflow.
+- Do not add or remove line breaks within a replacement.
+- Use replacements to: fix typos/grammar, swap weak verbs for strong action
+  verbs, quantify vague claims, and naturally work in a few of these missing
+  keywords where they genuinely fit: {missing_str}
+- Do NOT invent employers, titles, degrees, or dates not already present.
+- Propose at most 15 replacements. Fewer, high-quality ones are better than
+  many weak ones.
 
-Return ONLY the rewritten resume text. No preamble, no commentary,
-no markdown code fences, no "Here is your resume" type text.
+Output ONLY valid JSON — a list of objects, nothing else, no markdown fences:
+[{{"find": "...", "replace": "..."}}, ...]
 
-Original Resume:
+Resume text:
 {resume[:4000]}
 
-Job Description:
-{job[:2500]}
+Job description:
+{job[:2000]}
 """
+    last_err = None
     for model_name in ["gemini-2.5-flash", "gemini-2.5-pro"]:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
-            text = (response.text or "").strip()
-            if text:
-                return text
+            raw = (response.text or "").strip()
+            raw = re.sub(r"^```(json)?", "", raw.strip())
+            raw = re.sub(r"```$", "", raw.strip()).strip()
+            pairs = json.loads(raw)
+            if isinstance(pairs, list):
+                return [p for p in pairs if isinstance(p, dict) and p.get("find") and p.get("replace")]
         except Exception as e:
+            last_err = e
             if "quota" in str(e).lower() or "resource" in str(e).lower():
                 raise RuntimeError("QUOTA")
             continue
-    raise RuntimeError("FAILED")
+    raise RuntimeError(f"FAILED: {last_err}")
 
 # ================================================================
-# OFFLINE FIX (fallback when no AI available)
+# IN-PLACE PDF TEXT EDITOR
 # ================================================================
+# Applies find -> replace text swaps directly onto the original PDF bytes
+# using PyMuPDF: redact the old phrase, reinsert the replacement at the
+# same position/size/color. Layout, images, and photo are never touched.
 
-def fix_resume_offline(resume, job, missing):
-    additions = ""
+def _int_color_to_rgb(color_int):
+    r = ((color_int >> 16) & 255) / 255
+    g = ((color_int >> 8) & 255) / 255
+    b = (color_int & 255) / 255
+    return (r, g, b)
+
+def _find_span_info(page, needle):
+    d = page.get_text("dict")
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if needle in span.get("text", ""):
+                    return {
+                        "size": span.get("size", 11),
+                        "color": _int_color_to_rgb(span.get("color", 0)),
+                    }
+    return {"size": 11, "color": (0, 0, 0)}
+
+def apply_fixes_to_pdf(pdf_bytes, fix_pairs):
+    """
+    Returns (new_pdf_bytes, applied_list). applied_list only contains
+    pairs that were actually found and changed in the PDF.
+    """
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    applied = []
+
+    for pair in fix_pairs:
+        find = (pair.get("find") or "").strip()
+        replace = (pair.get("replace") or "").strip()
+        if not find or not replace or find == replace:
+            continue
+
+        found_any = False
+        for page in doc:
+            rects = page.search_for(find)
+            if not rects:
+                continue
+            found_any = True
+
+            info = _find_span_info(page, find)
+
+            for rect in rects:
+                page.add_redact_annot(rect, fill=(1, 1, 1))
+            page.apply_redactions()
+
+            for rect in rects:
+                baseline_y = rect.y1 - (rect.height * 0.22)
+                page.insert_text(
+                    (rect.x0, baseline_y),
+                    replace,
+                    fontsize=info["size"],
+                    fontname="helv",
+                    color=info["color"],
+                )
+        if found_any:
+            applied.append({"find": find, "replace": replace})
+
+    out_bytes = doc.tobytes()
+    doc.close()
+    return out_bytes, applied
+
+def append_suggestions_page(pdf_bytes, missing, recommendations):
+    """
+    Offline fallback when no AI is available to safely generate content-aware
+    swaps: leave every original page completely untouched (photo, layout,
+    fonts all preserved) and just append one new page listing suggestions.
+    """
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.new_page()
+
+    y = 50
+    page.insert_text((50, y), "ATS Improvement Suggestions", fontsize=16, fontname="helv", color=(0.1, 0.1, 0.5))
+    y += 30
+    page.insert_text((50, y), "(Generated locally — no AI model was available)", fontsize=9, fontname="helv", color=(0.4, 0.4, 0.4))
+    y += 30
+
     if missing:
-        additions = "\n\nAdditional Relevant Skills & Keywords:\n" + ", ".join(missing)
+        page.insert_text((50, y), "Missing keywords to consider adding:", fontsize=12, fontname="helv", color=(0, 0, 0))
+        y += 20
+        chunk = ", ".join(missing)
+        for i in range(0, len(chunk), 90):
+            page.insert_text((60, y), chunk[i:i + 90], fontsize=10, fontname="helv", color=(0, 0, 0))
+            y += 15
+        y += 15
 
-    note = (
-        "\n\n---\n"
-        "Note: This is a locally-generated draft (no AI model was available). "
-        "For best results, manually weave the keywords above into your Experience "
-        "and Skills sections, and add quantifiable achievements (numbers, %, $) "
-        "using strong action verbs like 'led', 'built', 'improved', 'launched'."
-    )
-    return resume.strip() + additions + note
+    if recommendations:
+        page.insert_text((50, y), "Recommendations:", fontsize=12, fontname="helv", color=(0, 0, 0))
+        y += 20
+        for r in recommendations:
+            page.insert_text((60, y), f"- {r}", fontsize=10, fontname="helv", color=(0, 0, 0))
+            y += 16
+
+    out_bytes = doc.tobytes()
+    doc.close()
+    return out_bytes
 
 # ================================================================
 # PDF GENERATION (fixed resume → downloadable PDF)
 # ================================================================
+
+def _break_long_tokens(line: str, max_token_len: int = 60) -> str:
+    """
+    Safety net for long unbroken 'words' (long URLs, run-on separator
+    lines like '---------', unbroken IDs) that could otherwise be wider
+    than the page and trip up multi_cell's word-wrapping.
+    """
+    words = line.split(" ")
+    fixed_words = []
+    for w in words:
+        if len(w) > max_token_len:
+            chunks = [w[i:i + max_token_len] for i in range(0, len(w), max_token_len)]
+            fixed_words.append(" ".join(chunks))
+        else:
+            fixed_words.append(w)
+    return " ".join(fixed_words)
+
 
 def generate_pdf(text: str) -> bytes:
     pdf = FPDF(format="A4")
@@ -211,18 +338,18 @@ def generate_pdf(text: str) -> bytes:
         is_heading = stripped.isupper() and 2 < len(stripped) < 60
 
         safe_line = stripped.encode("latin-1", "replace").decode("latin-1")
+        safe_line = _break_long_tokens(safe_line)
 
         if is_heading:
             pdf.set_font("Helvetica", style="B", size=12)
             pdf.ln(2)
-            pdf.multi_cell(0, 7, safe_line)
+            pdf.multi_cell(0, 7, safe_line, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
             pdf.set_font("Helvetica", size=11)
         else:
-            pdf.multi_cell(0, 6, safe_line if safe_line else " ")
+            pdf.multi_cell(0, 6, safe_line if safe_line else " ", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
 
-    output = pdf.output(dest="S")
-    # fpdf2 returns a bytearray
-    return bytes(output)
+    # fpdf2 returns a bytearray from output()
+    return bytes(pdf.output())
 
 # ================================================================
 # SESSION STATE
@@ -231,13 +358,16 @@ def generate_pdf(text: str) -> bytes:
 if "page" not in st.session_state:
     st.session_state.page = "upload"
     st.session_state.resume = None
+    st.session_state.resume_pdf_bytes = None
     st.session_state.job = None
     st.session_state.mode = "auto"
     st.session_state.result = None
     st.session_state.offline = None
     st.session_state.used_mode = None
-    st.session_state.fixed_text = None
+    st.session_state.fixed_pdf_bytes = None
     st.session_state.fixed_score = None
+    st.session_state.applied_fixes = None
+    st.session_state.fix_method = None
 
 # ================================================================
 # UPLOAD PAGE
@@ -268,12 +398,14 @@ def upload_page():
             st.error("Upload resume and provide valid job description.")
             return
 
-        resume_text = extract_pdf_text(resume)
+        resume_bytes = resume.getvalue()
+        resume_text = extract_pdf_text_from_bytes(resume_bytes)
         if not resume_text:
             st.error("Unable to read resume.")
             return
 
         st.session_state.resume = resume_text
+        st.session_state.resume_pdf_bytes = resume_bytes
         st.session_state.job = job
         st.session_state.mode = mode_map[mode]
         st.session_state.page = "analyzing"
@@ -389,32 +521,46 @@ def result_page():
 
 def fixing_page():
     st.markdown("## 🛠️ Fixing Your Resume")
+    st.caption("Editing your resume in place — layout, formatting, and photo stay exactly as they are. Only the text itself gets touched.")
     bar = st.progress(0)
     for i in [20, 40, 60, 80]:
         time.sleep(0.3)
         bar.progress(i)
 
-    resume = st.session_state.resume
+    resume_text = st.session_state.resume
+    original_pdf_bytes = st.session_state.resume_pdf_bytes
     job = st.session_state.job
     mode = st.session_state.mode
+    missing = st.session_state.offline["missing"] if st.session_state.offline else []
+    recommendations = st.session_state.offline["recommendations"] if st.session_state.offline else []
 
-    fixed_text = None
+    fixed_pdf_bytes = None
+    applied = []
+    fix_method = None
 
     if ONLINE_AVAILABLE and mode in ("online", "auto"):
         try:
-            fixed_text = fix_resume_online(resume, job)
+            fix_pairs = generate_fix_pairs_online(resume_text, job, missing)
+            fixed_pdf_bytes, applied = apply_fixes_to_pdf(original_pdf_bytes, fix_pairs)
+            if applied:
+                fix_method = "🟢 AI-targeted in-place edits"
+            else:
+                fixed_pdf_bytes = None  # nothing matched, fall through
         except Exception:
-            fixed_text = None  # fall through to offline fix
+            fixed_pdf_bytes = None  # fall through to offline fallback
 
-    if not fixed_text:
-        missing = st.session_state.offline["missing"] if st.session_state.offline else []
-        fixed_text = fix_resume_offline(resume, job, missing)
+    if fixed_pdf_bytes is None:
+        fixed_pdf_bytes = append_suggestions_page(original_pdf_bytes, missing, recommendations)
+        fix_method = "🟡 Local fallback: suggestions page appended (original pages untouched)"
 
-    st.session_state.fixed_text = fixed_text
+    st.session_state.fixed_pdf_bytes = fixed_pdf_bytes
+    st.session_state.applied_fixes = applied
+    st.session_state.fix_method = fix_method
 
-    # Re-score the fixed resume with the offline engine so before/after is
-    # comparable on the same scale regardless of which engine did the analysis.
-    st.session_state.fixed_score = offline_analysis(fixed_text, job)
+    # Re-score using text extracted from the edited PDF so before/after is
+    # comparable on the same scale regardless of which engine ran.
+    fixed_text_for_scoring = extract_pdf_text_from_bytes(fixed_pdf_bytes) or resume_text
+    st.session_state.fixed_score = offline_analysis(fixed_text_for_scoring, job)
 
     st.session_state.page = "fixed_result"
     st.rerun()
@@ -425,6 +571,7 @@ def fixing_page():
 
 def fixed_result_page():
     st.markdown("## ✅ Resume Fixed")
+    st.caption(f"Method: {st.session_state.fix_method}")
 
     old_score = st.session_state.offline["ats"] if st.session_state.offline else None
     new_score = st.session_state.fixed_score["ats"]
@@ -436,15 +583,31 @@ def fixed_result_page():
     else:
         col1.metric("New ATS Score", f"{new_score}%")
 
-    st.markdown("### 📄 Improved Resume Preview")
-    st.text_area("Preview (editable before download)", key="fixed_text", height=400)
+    fixed_pdf_bytes = st.session_state.fixed_pdf_bytes
 
-    pdf_bytes = generate_pdf(st.session_state.fixed_text)
+    # Render a preview image of the PDF so the user can visually confirm the
+    # original layout/photo were preserved.
+    try:
+        preview_doc = pymupdf.open(stream=fixed_pdf_bytes, filetype="pdf")
+        st.markdown("### 📄 Preview")
+        num_preview_pages = min(len(preview_doc), 3)
+        cols = st.columns(num_preview_pages)
+        for i in range(num_preview_pages):
+            pix = preview_doc[i].get_pixmap(dpi=110)
+            cols[i].image(pix.tobytes("png"), use_container_width=True, caption=f"Page {i + 1}")
+        preview_doc.close()
+    except Exception:
+        st.info("Preview unavailable, but your download below is ready.")
+
+    if st.session_state.applied_fixes:
+        with st.expander(f"🔍 See the {len(st.session_state.applied_fixes)} text change(s) applied"):
+            for fix in st.session_state.applied_fixes:
+                st.markdown(f"- ~~{fix['find']}~~ → **{fix['replace']}**")
 
     st.download_button(
-        "⬇️ Download Improved Resume (PDF)",
-        data=pdf_bytes,
-        file_name="Improved_Resume.pdf",
+        "⬇️ Download Fixed Resume (PDF)",
+        data=fixed_pdf_bytes,
+        file_name="Fixed_Resume.pdf",
         mime="application/pdf",
         use_container_width=True,
         type="primary"

@@ -1,7 +1,13 @@
+# ================================================================
+# AI CAREER MENTOR – ADVANCED ATS RESUME ANALYZER
+# FULL REWRITE MODE + MODE SELECTOR
+# GitHub CI/CD Hardened: Wrapped execution, secure random, strict exceptions
+# ================================================================
+
 import os
 import io
 import re
-import secrets  # Replaced 'random' to pass GitHub Bandit security tests
+import secrets
 
 import streamlit as st
 import pypdf
@@ -197,13 +203,25 @@ def upload_page():
     st.markdown("## 🤖 AI Career Mentor")
     
     if not ONLINE_AVAILABLE:
-        st.warning("⚠️ Gemini API Key not detected. The app will run in offline mode.")
+        st.warning("⚠️ Gemini API Key not detected. Online AI mode is disabled.")
         
     resume = st.file_uploader("📄 Upload Resume (PDF)", type=["pdf"])
     job = st.text_area("📋 Paste Job Description", height=200)
 
+    mode_selection = st.radio(
+        "🧠 Choose Analysis Mode:", 
+        ["Auto (Recommended)", "AI Model (Online)", "Local Analysis (Offline)"],
+        index=0
+    )
+
     if st.button("🚀 Analyze Resume", use_container_width=True):
         if resume and len(job.strip()) > 50:
+            mode_map = {
+                "Auto (Recommended)": "auto", 
+                "AI Model (Online)": "online", 
+                "Local Analysis (Offline)": "offline"
+            }
+            
             pdf_bytes = resume.getvalue()
             extracted_text = extract_pdf_text_from_bytes(pdf_bytes)
             extracted_image = extract_profile_image(pdf_bytes)
@@ -214,6 +232,7 @@ def upload_page():
                 "original_pdf_bytes": pdf_bytes,
                 "profile_image": extracted_image,
                 "job": job,
+                "mode": mode_map[mode_selection],
                 "page": "analyzing"
             })
             st.rerun()
@@ -232,6 +251,10 @@ def analyzing_page():
 
 def result_page():
     st.markdown("## ✅ ATS Analysis Report")
+    
+    mode_used = st.session_state.get("mode", "auto").upper()
+    st.caption(f"Mode Used: {mode_used}")
+    
     st.metric("Current ATS Score", f"{st.session_state.offline['ats']}%")
     st.markdown("### ❌ Missing Keywords")
     st.write(", ".join(st.session_state.offline["missing"]))
@@ -241,8 +264,21 @@ def result_page():
     st.caption("We will extract your content (and photo) and generate a brand-new, strictly formatted, single-column ATS document.")
     st.session_state.target_score = st.slider("🎯 Target ATS Score", 50, 98, 90)
     
-    if not ONLINE_AVAILABLE:
-        st.error("AI is currently offline. You must configure an API key to rewrite the resume.")
+    if st.session_state.mode == "offline":
+        st.warning("⚠️ You selected **Offline Mode**. Completely rebuilding the resume requires an AI model (Online Mode).")
+        if st.button("🔙 Go Back & Change Mode"):
+            st.session_state.page = "upload"
+            st.rerun()
+    elif st.session_state.mode == "online" and not ONLINE_AVAILABLE:
+        st.error("⚠️ You selected **Online Mode**, but the Gemini API Key is missing or invalid.")
+        if st.button("🔙 Go Back"):
+            st.session_state.page = "upload"
+            st.rerun()
+    elif not ONLINE_AVAILABLE:
+        st.error("⚠️ AI is offline (No API Key). Cannot rebuild resume.")
+        if st.button("🔙 Go Back"):
+            st.session_state.page = "upload"
+            st.rerun()
     else:
         if st.button("✅ Yes, rebuild my resume", type="primary", use_container_width=True):
             st.session_state.page = "fixing"

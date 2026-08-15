@@ -4,3 +4,4 @@ pypdf
 
 
 fpdf2
+pymupdf

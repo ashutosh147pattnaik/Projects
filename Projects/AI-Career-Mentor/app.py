@@ -306,6 +306,64 @@ def append_suggestions_page(pdf_bytes, missing, recommendations):
     return out_bytes
 
 # ================================================================
+# ITERATIVE FIX-TO-TARGET LOOP
+# ================================================================
+
+def fix_resume_to_target(original_pdf_bytes, resume_text, job, target_score, mode, max_rounds=3):
+    """
+    Iteratively applies truthful, in-place text edits trying to reach
+    target_score. Stops early once the target is hit, or once a round
+    produces no new applicable edits (plateau — further gains would
+    require content that isn't genuinely in the resume).
+
+    Returns: (fixed_pdf_bytes, applied_fixes, fix_method, final_score_data, rounds_used)
+    """
+    current_pdf_bytes = original_pdf_bytes
+    current_text = resume_text
+    all_applied = []
+    fix_method = None
+    rounds_used = 0
+
+    score_data = offline_analysis(current_text, job)
+
+    if ONLINE_AVAILABLE and mode in ("online", "auto"):
+        for round_num in range(max_rounds):
+            score_data = offline_analysis(current_text, job)
+            if score_data["ats"] >= target_score:
+                break
+            try:
+                fix_pairs = generate_fix_pairs_online(current_text, job, score_data["missing"])
+                new_pdf_bytes, applied = apply_fixes_to_pdf(current_pdf_bytes, fix_pairs)
+            except Exception:
+                break  # stop trying online fixes, fall through to whatever we already have
+
+            rounds_used += 1
+            if not applied:
+                break  # plateau: no more genuine matches to improve on
+
+            current_pdf_bytes = new_pdf_bytes
+            current_text = extract_pdf_text_from_bytes(new_pdf_bytes) or current_text
+            all_applied.extend(applied)
+
+        if all_applied:
+            fix_method = "🟢 AI-targeted in-place edits"
+
+    final_score_data = offline_analysis(current_text, job)
+
+    if fix_method is None:
+        # Nothing was safely applied online (no key, or nothing matched) —
+        # fall back to appending a suggestions page, which leaves every
+        # original page (and the photo) completely untouched.
+        current_pdf_bytes = append_suggestions_page(
+            original_pdf_bytes, score_data["missing"], score_data["recommendations"]
+        )
+        current_text = extract_pdf_text_from_bytes(current_pdf_bytes) or resume_text
+        final_score_data = offline_analysis(current_text, job)
+        fix_method = "🟡 Local fallback: suggestions page appended (original pages untouched)"
+
+    return current_pdf_bytes, all_applied, fix_method, final_score_data, rounds_used
+
+# ================================================================
 # PDF GENERATION (fixed resume → downloadable PDF)
 # ================================================================
 
@@ -368,6 +426,8 @@ if "page" not in st.session_state:
     st.session_state.fixed_score = None
     st.session_state.applied_fixes = None
     st.session_state.fix_method = None
+    st.session_state.target_score = 90
+    st.session_state.rounds_used = 0
 
 # ================================================================
 # UPLOAD PAGE
@@ -499,7 +559,14 @@ def result_page():
 
     # ---------------- CONSENT STEP ----------------
     st.markdown("### 🛠️ Want us to fix these issues automatically?")
-    st.caption("We'll rewrite your resume to close keyword gaps and improve ATS readability, then give you a PDF to download.")
+    st.caption("We'll make targeted, truthful edits directly on your resume to close keyword gaps and improve ATS readability — layout and photo stay untouched.")
+
+    target_score = st.slider(
+        "🎯 Target ATS Score",
+        min_value=50, max_value=98, value=90, step=1,
+        help="We'll run multiple rounds of edits trying to reach this score. If your resume genuinely doesn't contain enough relevant experience for the job, we'll stop short and tell you honestly why, rather than inventing skills you don't have."
+    )
+    st.session_state.target_score = target_score
 
     col1, col2 = st.columns(2)
     with col1:
@@ -531,36 +598,17 @@ def fixing_page():
     original_pdf_bytes = st.session_state.resume_pdf_bytes
     job = st.session_state.job
     mode = st.session_state.mode
-    missing = st.session_state.offline["missing"] if st.session_state.offline else []
-    recommendations = st.session_state.offline["recommendations"] if st.session_state.offline else []
+    target_score = st.session_state.get("target_score", 90)
 
-    fixed_pdf_bytes = None
-    applied = []
-    fix_method = None
-
-    if ONLINE_AVAILABLE and mode in ("online", "auto"):
-        try:
-            fix_pairs = generate_fix_pairs_online(resume_text, job, missing)
-            fixed_pdf_bytes, applied = apply_fixes_to_pdf(original_pdf_bytes, fix_pairs)
-            if applied:
-                fix_method = "🟢 AI-targeted in-place edits"
-            else:
-                fixed_pdf_bytes = None  # nothing matched, fall through
-        except Exception:
-            fixed_pdf_bytes = None  # fall through to offline fallback
-
-    if fixed_pdf_bytes is None:
-        fixed_pdf_bytes = append_suggestions_page(original_pdf_bytes, missing, recommendations)
-        fix_method = "🟡 Local fallback: suggestions page appended (original pages untouched)"
+    fixed_pdf_bytes, applied, fix_method, final_score_data, rounds_used = fix_resume_to_target(
+        original_pdf_bytes, resume_text, job, target_score, mode
+    )
 
     st.session_state.fixed_pdf_bytes = fixed_pdf_bytes
     st.session_state.applied_fixes = applied
     st.session_state.fix_method = fix_method
-
-    # Re-score using text extracted from the edited PDF so before/after is
-    # comparable on the same scale regardless of which engine ran.
-    fixed_text_for_scoring = extract_pdf_text_from_bytes(fixed_pdf_bytes) or resume_text
-    st.session_state.fixed_score = offline_analysis(fixed_text_for_scoring, job)
+    st.session_state.fixed_score = final_score_data
+    st.session_state.rounds_used = rounds_used
 
     st.session_state.page = "fixed_result"
     st.rerun()
@@ -574,14 +622,29 @@ def fixed_result_page():
     st.caption(f"Method: {st.session_state.fix_method}")
 
     old_score = st.session_state.offline["ats"] if st.session_state.offline else None
-    new_score = st.session_state.fixed_score["ats"]
+    new_score_data = st.session_state.fixed_score
+    new_score = new_score_data["ats"]
+    target_score = st.session_state.get("target_score", 90)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     if old_score is not None:
         col1.metric("Before", f"{old_score}%")
         col2.metric("After", f"{new_score}%", delta=f"{new_score - old_score:+d}%")
     else:
         col1.metric("New ATS Score", f"{new_score}%")
+    col3.metric("Target", f"{target_score}%")
+
+    if new_score >= target_score:
+        st.success(f"🎯 Target reached — your resume now scores {new_score}%, at or above your {target_score}% goal.")
+    else:
+        still_missing = new_score_data.get("missing", [])
+        st.warning(
+            f"We got your resume to **{new_score}%**, short of your {target_score}% target. "
+            f"We stopped because the remaining gap would require claiming skills or experience "
+            f"that genuinely aren't in your resume — we won't fabricate those. "
+            + (f"Still missing: {', '.join(still_missing[:10])}." if still_missing else "")
+        )
+        st.caption("To close the rest of the gap: honestly, if you have any of the missing experience, add it yourself; otherwise this job may want a stronger match than your current background provides.")
 
     fixed_pdf_bytes = st.session_state.fixed_pdf_bytes
 
@@ -600,7 +663,7 @@ def fixed_result_page():
         st.info("Preview unavailable, but your download below is ready.")
 
     if st.session_state.applied_fixes:
-        with st.expander(f"🔍 See the {len(st.session_state.applied_fixes)} text change(s) applied"):
+        with st.expander(f"🔍 See the {len(st.session_state.applied_fixes)} text change(s) applied across {st.session_state.get('rounds_used', 1)} round(s)"):
             for fix in st.session_state.applied_fixes:
                 st.markdown(f"- ~~{fix['find']}~~ → **{fix['replace']}**")
 
